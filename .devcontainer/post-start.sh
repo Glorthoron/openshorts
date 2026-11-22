@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
-mkdir -p output uploads .os-cache exports
+mkdir -p output uploads .os-cache
+mkdir -p "$HOME/exports"
 chmod 0777 output uploads .os-cache 2>/dev/null || true
 
 # Restos de la sesión anterior: si ya los descargaste, sobran.

@@ -8,7 +8,8 @@ sudo apt-get install -y -qq zip unzip jq >/dev/null
 
 # El backend corre como appuser (uid 999) y escribe en estos tres directorios,
 # que llegan por bind mount y pertenecen al usuario del codespace (uid 1000).
-mkdir -p output uploads .os-cache exports
+mkdir -p output uploads .os-cache
+mkdir -p "$HOME/exports"
 chmod 0777 output uploads .os-cache
 
 chmod +x scripts/os-housekeeping
