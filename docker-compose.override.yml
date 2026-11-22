@@ -1,0 +1,38 @@
+# Codespaces: 4 vCPU / 16 GB, sin GPU, sesión de un rato.
+# Compose carga este fichero solo si está junto a docker-compose.yml.
+services:
+  backend:
+    environment:
+      - MAX_CONCURRENT_JOBS=2
+      # El propio panel borra los trabajos a las 6 h. La limpieza por ficheros
+      # la hace os-housekeeping; esto evita que se acumulen si no lo ejecutas.
+      - JOB_RETENTION_SECONDS=21600
+      - SOURCE_RETENTION_SECONDS=21600
+      - WHISPER_MODEL=small
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE=int8
+      - FFMPEG_THREADS=2
+      - OMP_NUM_THREADS=1
+      # El bind mount .:/app tapa el yolov8n.pt horneado en la imagen y appuser
+      # no puede escribir en la raíz del repo: el modelo va a /tmp.
+      - YOLO_MODEL_PATH=/tmp/yolov8n.pt
+      # HOME=/app por defecto haría que whisper cachee dentro del repo.
+      - HOME=/cache
+      - XDG_CACHE_HOME=/cache
+      - HF_HOME=/cache/huggingface
+      - TMPDIR=/tmp
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - UPLOAD_POST_API_KEY=${UPLOAD_POST_API_KEY:-}
+    volumes:
+      - .:/app
+      - /app/__pycache__
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+      - ./.os-cache:/cache
+
+  renderer:
+    # El renderer (Pro mode) está roto en main: render-service/package-lock.json
+    # está en Remotion 4.0.446 y remotion/ en 4.0.541, y Remotion exige la misma
+    # versión en todos sus paquetes (issue #165). Entra en bucle de reinicio.
+    # Tampoco hace falta para recortar. Con este perfil no arranca.
+    profiles: ["pro"]

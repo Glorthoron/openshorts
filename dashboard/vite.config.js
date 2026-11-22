@@ -31,6 +31,7 @@ export default defineConfig({
   },
   server: {
     allowedHosts: [
+      '.app.github.dev',
       'openshorts.app',
       'www.openshorts.app'
     ],

@@ -52,3 +52,5 @@ CLAUDE.local.md
 
 # Rust build output
 osrender/target/
+.os-cache/
+exports/

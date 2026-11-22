@@ -1,0 +1,30 @@
+{
+  "name": "OpenShorts (CPU, 16 GB)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "codespace",
+      "installZsh": false
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "forwardPorts": [5175, 8000],
+  "portsAttributes": {
+    "5175": {
+      "label": "Panel OpenShorts",
+      "onAutoForward": "openBrowserOnce"
+    },
+    "8000": {
+      "label": "API OpenShorts",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "remoteUser": "codespace"
+}

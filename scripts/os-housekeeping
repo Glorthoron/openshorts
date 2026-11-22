@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# os-housekeeping: disco y exportaciones de OpenShorts.
+#
+#   os-housekeeping status [--short]     qué ocupa el disco
+#   os-housekeeping pack                 junta los clips de todos los trabajos
+#                                        en ~/exports/clips.zip
+#   os-housekeeping clean [--yes] [--deep] [--force]
+#                                        borra output/, uploads/ y exportaciones
+#   os-housekeeping prune-stale [--hours N] [--quiet]
+#                                        borra trabajos con más de N horas
+#   os-housekeeping watchdog [--daemon]  prune-stale cada 30 min mientras viva
+#
+# El repo se localiza desde el directorio actual, desde /workspaces/openshorts
+# o desde $OS_ROOT. Nunca se borra nada fuera de output/, uploads/, .os-cache/
+# y ~/exports.
+set -Eeuo pipefail
+
+LOG="${HOME:-/tmp}/.os-housekeeping.log"
+PIDFILE="${HOME:-/tmp}/.os-housekeeping.pid"
+EXPORTS="${HOME:-/tmp}/exports"
+QUIET=0
+PACK_TMP=""
+
+cleanup_tmp() {
+  [[ -n "$PACK_TMP" && -d "$PACK_TMP" ]] && rm -rf -- "$PACK_TMP"
+  return 0
+}
+trap cleanup_tmp EXIT
+
+die() { printf 'os-housekeeping: %s\n' "$*" >&2; exit 1; }
+say() { [[ "$QUIET" == "1" ]] || printf '%s\n' "$*"; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+resolve_root() {
+  if [[ -n "${OS_ROOT:-}" ]]; then
+    [[ -d "$OS_ROOT" ]] || return 1
+    printf '%s' "$OS_ROOT"
+    return 0
+  fi
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    if [[ -f "$d/app.py" && -f "$d/docker-compose.yml" ]]; then
+      printf '%s' "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  if [[ -d /workspaces/openshorts && -f /workspaces/openshorts/app.py ]]; then
+    printf '%s' /workspaces/openshorts
+    return 0
+  fi
+  return 1
+}
+
+ROOT="$(resolve_root)" || die "no encuentro el repo de OpenShorts (define OS_ROOT=/ruta/al/repo)"
+[[ "$ROOT" == "/" ]] && die "raíz inválida"
+[[ -f "$ROOT/app.py" && -f "$ROOT/docker-compose.yml" ]] || die "no parece el repo de OpenShorts: $ROOT"
+
+OUTPUT="$ROOT/output"
+UPLOADS="$ROOT/uploads"
+CACHE="$ROOT/.os-cache"
+
+job_running() {
+  docker exec openshorts-backend sh -c 'pgrep -f "main\.py" >/dev/null 2>&1' 2>/dev/null
+}
+
+human_size() {
+  du -sh "$1" 2>/dev/null | cut -f1 || echo "0"
+}
+
+count_clips() {
+  find "$OUTPUT" -type f -name '*.mp4' ! -name 'temp_*' 2>/dev/null | wc -l | tr -d ' '
+}
+
+count_jobs() {
+  find "$OUTPUT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
+cmd_status() {
+  local short=0
+  [[ "${1:-}" == "--short" ]] && short=1
+
+  if [[ "$short" == "1" ]]; then
+    say "disco libre $(df -h "$ROOT" | awk 'NR==2 {print $4}') | output $(human_size "$OUTPUT") | trabajos $(count_jobs) | clips $(count_clips)"
+    return 0
+  fi
+
+  say "repo:        $ROOT"
+  say "disco libre: $(df -h "$ROOT" | awk 'NR==2 {print $4" de "$2}')"
+  say "output/:     $(human_size "$OUTPUT")  ($(count_jobs) trabajos, $(count_clips) clips)"
+  say "uploads/:    $(human_size "$UPLOADS")"
+  say ".os-cache/:  $(human_size "$CACHE")  (modelos whisper y YOLO)"
+  say "exports/:    $(human_size "$EXPORTS")"
+  say
+  say "Docker:"
+  docker system df 2>/dev/null | sed 's/^/  /' || say "  (docker no responde)"
+  say
+  if job_running; then
+    say "Hay un clip procesándose ahora mismo."
+  else
+    say "Ningún clip en marcha."
+  fi
+}
+
+cmd_pack() {
+  local tmp dest total=0
+  PACK_TMP="$(mktemp -d)"
+  tmp="$PACK_TMP"
+  dest="$tmp/clips"
+  mkdir -p "$dest" "$EXPORTS"
+
+  local d id
+  for d in "$OUTPUT"/*/; do
+    [[ -d "$d" ]] || continue
+    id="$(basename "$d")"
+    mkdir -p "$dest/$id"
+    # Preferimos el ZIP del propio panel: elige la versión vigente de cada clip
+    # (subtitulado, hook, recorte) en vez de la original.
+    if curl -sf --max-time 120 -o "$tmp/job.zip" \
+        "http://localhost:8000/api/jobs/$id/download-all" 2>/dev/null; then
+      unzip -q -o "$tmp/job.zip" -d "$dest/$id" 2>/dev/null || true
+      rm -f "$tmp/job.zip"
+    else
+      find "$d" -maxdepth 1 -type f -name '*.mp4' ! -name 'temp_*' ! -name 'wm_*' \
+        -exec cp {} "$dest/$id/" \; 2>/dev/null || true
+    fi
+    if [[ -n "$(find "$dest/$id" -type f -name '*.mp4' -print -quit)" ]]; then
+      total=$(( total + $(find "$dest/$id" -type f -name '*.mp4' | wc -l) ))
+    else
+      rmdir "$dest/$id" 2>/dev/null || true
+    fi
+  done
+
+  [[ "$total" -gt 0 ]] || die "no hay clips que empaquetar en $OUTPUT"
+
+  ( cd "$dest" && zip -q -r "$EXPORTS/clips.zip" . )
+  say "Empaquetados $total clips en $EXPORTS/clips.zip ($(human_size "$EXPORTS/clips.zip"))"
+  say
+  say "Desde tu Mac:"
+  say "  gh codespace cp -e remote:exports/clips.zip ."
+  say
+  say "O todo en un paso, incluida la limpieza:"
+  say "  ./pull-clips.sh"
+}
+
+cmd_prune_stale() {
+  local hours=6
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hours) hours="${2:?falta el número de horas}"; shift 2 ;;
+      --quiet) QUIET=1; shift ;;
+      *) die "opción desconocida: $1" ;;
+    esac
+  done
+  [[ "$hours" =~ ^[0-9]+$ ]] || die "--hours necesita un entero"
+
+  if job_running; then
+    say "Hay un clip en marcha, no borro nada."
+    return 0
+  fi
+
+  local mins=$(( hours * 60 )) removed=0
+  while IFS= read -r -d '' path; do
+    sudo rm -rf -- "$path"
+    removed=$(( removed + 1 ))
+  done < <(find "$OUTPUT" -mindepth 1 -maxdepth 1 -type d -mmin +"$mins" -print0 2>/dev/null || true)
+
+  if [[ -d "$UPLOADS" ]]; then
+    find "$UPLOADS" -mindepth 1 -type f -mmin +"$mins" -print0 2>/dev/null |
+      while IFS= read -r -d '' f; do sudo rm -f -- "$f"; done || true
+  fi
+
+  say "Borrados $removed trabajos con más de $hours h."
+  log "prune-stale hours=$hours removed=$removed"
+}
+
+cmd_clean() {
+  local deep=0 assume_yes=0 force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --deep) deep=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      --force) force=1; shift ;;
+      *) die "opción desconocida: $1" ;;
+    esac
+  done
+
+  if job_running && [[ "$force" != "1" ]]; then
+    die "hay un clip procesándose; espera o usa --force"
+  fi
+
+  if [[ "$assume_yes" != "1" ]]; then
+    printf 'Se borrarán output/, uploads/ y %s. ¿Seguir? [s/N] ' "$EXPORTS"
+    read -r answer
+    [[ "$answer" == s* || "$answer" == S* ]] || { say "Nada borrado."; return 0; }
+  fi
+
+  local before
+  before="$(df -h "$ROOT" | awk 'NR==2 {print $4}')"
+
+  sudo rm -rf -- "$OUTPUT"/* "$UPLOADS"/* "$EXPORTS"/* 2>/dev/null || true
+  mkdir -p "$OUTPUT" "$UPLOADS" "$EXPORTS"
+
+  docker container prune -f >/dev/null 2>&1 || true
+  docker builder prune -f >/dev/null 2>&1 || true
+
+  if [[ "$deep" == "1" ]]; then
+    # Obliga a reconstruir la imagen en el siguiente arranque (30-40 min).
+    docker image prune -a -f >/dev/null 2>&1 || true
+    sudo rm -rf -- "$CACHE"/* 2>/dev/null || true
+    say "Limpieza profunda: imágenes y modelos fuera."
+  fi
+
+  chmod 0777 "$OUTPUT" "$UPLOADS" "$CACHE" 2>/dev/null || true
+
+  log "clean deep=$deep"
+  say "Hecho. Disco libre: $before -> $(df -h "$ROOT" | awk 'NR==2 {print $4}')"
+}
+
+cmd_watchdog() {
+  if [[ "${1:-}" == "--daemon" ]]; then
+    if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      say "watchdog ya en marcha (pid $(cat "$PIDFILE"))"
+      return 0
+    fi
+    setsid nohup "$0" watchdog >/dev/null 2>&1 &
+    echo $! >"$PIDFILE"
+    say "watchdog en marcha (pid $!)"
+    return 0
+  fi
+
+  log "watchdog start"
+  while true; do
+    sleep 1800
+    if job_running; then
+      continue
+    fi
+    cmd_prune_stale --hours 6 --quiet || true
+    docker container prune -f >/dev/null 2>&1 || true
+    log "watchdog tick"
+  done
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    status) cmd_status "$@" ;;
+    pack) cmd_pack "$@" ;;
+    clean) cmd_clean "$@" ;;
+    prune-stale) cmd_prune_stale "$@" ;;
+    watchdog) cmd_watchdog "$@" ;;
+    -h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "subcomando desconocido: $cmd (prueba --help)" ;;
+  esac
+}
+
+main "$@"
