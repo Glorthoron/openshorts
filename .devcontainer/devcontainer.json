@@ -6,6 +6,7 @@
       "username": "codespace",
       "installZsh": false
     },
+    "ghcr.io/devcontainers/features/sshd:1": {},
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
   "hostRequirements": {
