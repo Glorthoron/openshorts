@@ -5,6 +5,7 @@ Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 import math
+import re
 
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
@@ -430,6 +431,178 @@ def dedupe_overlapping(shorts, ratio=0.25):
         if not clash:
             kept.append((idx, clip))
     return [c for _, c in sorted(kept, key=lambda p: p[0])]
+
+
+# --- Sentence-anchored clip boundaries -------------------------------------
+# The detail pass used to receive a whole window (start, end, text) and return
+# absolute seconds. The model cannot see where a sentence falls inside 180 s,
+# so 8 of 14 boundaries on the 22-nov-2026 pass landed mid-phrase; word
+# snapping only pulls ±1.5 s to the nearest word. Let the model name the first
+# and last complete sentence, and derive the time span here.
+
+LEAD_SILENCE = 0.15      # s kept before the first word
+TAIL_SILENCE = 0.35      # s kept after the last word
+MAX_JOIN_GAP = 2.0       # s; a longer pause ends the clip instead of bridging it
+
+
+def sentence_list(segments):
+    """Whisper segments as ``[{id, start, end, text}]`` with stable global ids."""
+    out = []
+    for seg in segments or []:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(seg.get("start", 0))
+            end = float(seg.get("end", 0))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        out.append({"id": f"s{len(out) + 1:04d}", "start": start, "end": end, "text": text})
+    return out
+
+
+_ID_RE = re.compile(r"^(?:s(?:entence)?[\s_-]*)?(\d+)$", re.IGNORECASE)
+
+
+def normalize_sentence_id(raw):
+    """``"s201"``, ``"S0201"``, ``"201"`` and ``"sentence 201"`` -> ``"s0201"``.
+
+    Small models copy ids loosely; a miss is not a wrong clip, just a fallback
+    to the numeric proposal, but normalising keeps the common shapes working.
+    """
+    text = str(raw or "").strip()
+    match = _ID_RE.match(text)
+    return f"s{int(match.group(1)):04d}" if match else text
+
+
+def resolve_sentence_span(start_id, end_id, sentences, video_duration,
+                          min_duration=15.0, max_duration=60.0,
+                          window_start=None, window_end=None):
+    """``(start, end)`` covering whole sentences from ``start_id`` to ``end_id``.
+
+    Grows or shrinks by COMPLETE sentences until the band is met, so a cut
+    never lands inside a phrase. Padding never steals a neighbour: it is
+    clamped to half of the real gap, so contiguous Whisper segments produce a
+    clean cut instead of 150/350 ms of the next sentence.
+
+    Returns ``None`` when the ids are unknown or outside the candidate window,
+    when the span would bridge a pause longer than ``MAX_JOIN_GAP``, when one
+    sentence alone is longer than ``max_duration``, or when the band cannot be
+    met without leaving the window — the caller then falls back.
+    """
+    sentences = list(sentences or [])
+    index = {s["id"]: k for k, s in enumerate(sentences)}
+    i = index.get(normalize_sentence_id(start_id))
+    j = index.get(normalize_sentence_id(end_id))
+    if i is None or j is None:
+        return None
+    if j < i:
+        i, j = j, i
+    duration = max(0.0, float(video_duration or 0))
+    lo = 0.0 if window_start is None else max(0.0, float(window_start))
+    hi = duration if window_end is None else min(duration, float(window_end))
+    if hi <= lo:
+        return None
+    # Only sentences that sit fully inside the candidate window: the detail
+    # pass never saw the others, and a clip must not jump to another group.
+    pool = {k for k, s in enumerate(sentences)
+            if s["start"] >= lo - 1e-6 and s["end"] <= hi + 1e-6}
+    if i not in pool or j not in pool:
+        return None
+
+    # A span that bridges a long internal pause is not one moment: bounce it
+    # so the caller can fall back instead of shipping 30 s of dead air.
+    for k in range(i, j):
+        if sentences[k + 1]["start"] - sentences[k]["end"] > MAX_JOIN_GAP:
+            return None
+
+    def lead(k):
+        gap = sentences[k]["start"] - sentences[k - 1]["end"] if k > 0 else LEAD_SILENCE
+        return min(LEAD_SILENCE, max(0.0, gap) / 2)
+
+    def tail(k):
+        gap = sentences[k + 1]["start"] - sentences[k]["end"] if k + 1 < len(sentences) else TAIL_SILENCE
+        return min(TAIL_SILENCE, max(0.0, gap) / 2)
+
+    def span(a, b):
+        return (max(0.0, sentences[a]["start"] - lead(a)),
+                min(duration, sentences[b]["end"] + tail(b)))
+
+    def joins(k):  # sentence k flows into k + 1 without a long pause
+        return k + 1 in pool and sentences[k + 1]["start"] - sentences[k]["end"] <= MAX_JOIN_GAP
+
+    # A Whisper segment is not always a sentence: it often stops at a comma.
+    # When the window has punctuation at all, prefer edges on segments that
+    # close a sentence. Without punctuation this is skipped and the span is
+    # built from whole segments exactly as before.
+    punctuated = any(closes_sentence(sentences[k]["text"]) for k in pool)
+
+    start, end = span(i, j)
+    while end - start > max_duration and j > i:
+        j -= 1
+        start, end = span(i, j)
+    if end - start > max_duration:
+        return None
+    if punctuated and not closes_sentence(sentences[j]["text"]):
+        for k in range(j - 1, i - 1, -1):
+            if closes_sentence(sentences[k]["text"]):
+                s2, e2 = span(i, k)
+                if e2 - s2 >= min_duration:
+                    j, start, end = k, s2, e2
+                break
+
+    while end - start < min_duration:
+        if (j + 1 in pool
+                and sentences[j + 1]["start"] - sentences[j]["end"] <= MAX_JOIN_GAP):
+            nj = j + 1
+            ns, ne = span(i, nj)
+            if ne - ns <= max_duration:
+                j, end = nj, ne
+                continue
+        if (i - 1 in pool
+                and sentences[i]["start"] - sentences[i - 1]["end"] <= MAX_JOIN_GAP):
+            ni = i - 1
+            ns, ne = span(ni, j)
+            if ne - ns <= max_duration:
+                i, start = ni, ns
+                continue
+        break
+
+    if punctuated:
+        # End: run on to the segment that closes the sentence.
+        k = j
+        while not closes_sentence(sentences[k]["text"]) and joins(k):
+            s2, e2 = span(i, k + 1)
+            if e2 - s2 > max_duration:
+                break
+            k += 1
+        if closes_sentence(sentences[k]["text"]):
+            j = k
+            start, end = span(i, j)
+        # Start: step back to just after the previous sentence closed.
+        k = i
+        while k - 1 in pool and not closes_sentence(sentences[k - 1]["text"]) and joins(k - 1):
+            s2, e2 = span(k - 1, j)
+            if e2 - s2 > max_duration:
+                break
+            k -= 1
+        if k == 0 or (k - 1 >= 0 and closes_sentence(sentences[k - 1]["text"])):
+            i = k
+            start, end = span(i, j)
+
+    if end - start < min_duration or end - start > max_duration:
+        return None
+    return (round(start, 3), round(end, 3))
+
+
+_CLOSE_RE = re.compile(r"[.!?\u2026][\"'\u00bb\u201d)\]]*\s*$")
+
+
+def closes_sentence(text):
+    """True when a transcript segment ends a sentence (. ! ? or ellipsis)."""
+    return bool(_CLOSE_RE.search(str(text or "")))
 
 
 def snap_clip_to_words(start, end, words, video_duration,

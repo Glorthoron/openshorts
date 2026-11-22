@@ -8,7 +8,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
                             lookup_model_prices)
@@ -34,7 +34,20 @@ class ScoreResponse(BaseModel):
 class DetailClipModel(BaseModel):
     start: float
     end: float
+    # The first and last COMPLETE sentence of the clip, as ids from the
+    # window's `sentences` list. When both are set the backend derives the
+    # times from them and ignores `start`/`end` (see resolve_sentence_span).
+    start_sentence: str = ""
+    end_sentence: str = ""
     source_window_id: str
+
+    @field_validator("start_sentence", "end_sentence", mode="before")
+    @classmethod
+    def _sentence_id(cls, value):
+        # A local model may send null or a number here; treat both as "no id"
+        # and let the numeric proposal carry the clip, instead of failing the
+        # whole response and losing every clip of the job.
+        return "" if value is None else str(value)
     predicted_score: int
     video_description_for_tiktok: str
     video_description_for_instagram: str
@@ -299,7 +312,17 @@ Choose the BEST short clips from these shortlisted candidate windows.
 
 CLIP RULES:
 - Return only valid JSON.
-- Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
+- Each clip must be {min_secs:g} to {max_secs:g} seconds long.
+- In `text`, every sentence starts with its id in brackets, e.g.
+  `[s0041] Hola, ...`; the ids count the sentences from the start of the
+  source. Name the FIRST and LAST sentence of the clip in `start_sentence` /
+  `end_sentence`. The clip begins exactly at the start of `start_sentence`
+  and ends at the end of `end_sentence`, so choose whole sentences that hold
+  the setup and the payoff; never take half of one. `start` and `end` are
+  still required by the schema but are ignored when both ids are present.
+- The sentence ids you use MUST be ones visible in the candidate window you
+  took the clip from (`source_window_id`). Never point at a sentence from
+  another window.
 - Stay within the candidate window boundaries.
 - THE 2-SECOND RULE: the clip MUST open on its strongest moment. If the first
   2 seconds would not stop a cold viewer from scrolling, move the start or skip the clip.
@@ -359,6 +382,8 @@ Return only:
     {{
       "start": <number>,
       "end": <number>,
+      "start_sentence": "<id of the first whole sentence>",
+      "end_sentence": "<id of the last whole sentence>",
       "source_window_id": "<window id>",
       "predicted_score": <integer 0-100>,
       "video_description_for_tiktok": "<description + hashtags>",

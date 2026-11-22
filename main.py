@@ -35,6 +35,7 @@ import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             detail_plan, vision_targets,
+                            resolve_sentence_span, sentence_list,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
@@ -2468,6 +2469,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         for word in segment.get('words', []):
             words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
 
+    # Sentence ids the detail pass names instead of guessing seconds inside a
+    # 180-second window. See resolve_sentence_span.
+    sentences = sentence_list(transcript_result.get('segments'))
+
     try:
         # Scoring windows must be able to CONTAIN a max-length clip (the detail
         # prompt keeps clips inside their candidate window), so scale them with
@@ -2496,10 +2501,20 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         if heat:
             print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
 
-        def _payload(ws):
+        def _payload(ws, with_sentences=False):
             out = []
             for w in ws:
                 item = {"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]}
+                if with_sentences:
+                    # Inline sentence ids, not a second JSON object per
+                    # sentence: the ids cost ~9 characters each instead of
+                    # ~58, so the detail prompt grows ~15% instead of ~90%
+                    # (a 5-minute source still fits a 4096-token local model).
+                    item["text"] = " ".join(
+                        f"[{s['id']}] {s['text']}"
+                        for s in sentences
+                        if s["end"] > w["start"] and s["start"] < w["end"]
+                    )
                 h = heat.get(w["id"])
                 if h:
                     item["viewers_clipped"] = h["clips"]
@@ -2552,7 +2567,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
-                    windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                    windows_json=json.dumps(_payload(ws, with_sentences=True), ensure_ascii=False))
             return build
 
         shorts = []
@@ -2594,14 +2609,49 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+        anchored = 0
+        dropped_bad_ids = 0
+        anchored_shorts = []
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
-            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
+            window = by_id.get(str(s.get("source_window_id") or ""))
+            span = resolve_sentence_span(
+                s.get("start_sentence"), s.get("end_sentence"), sentences,
+                video_duration, min_duration=min_secs, max_duration=max_secs,
+                window_start=window["start"] if window else None,
+                window_end=window["end"] if window else None)
+            if span:
+                s["start"], s["end"] = span
+                anchored += 1
+                anchored_shorts.append(s)
+                continue
+            # Older models / no sentence ids: the numeric proposal, snapped.
+            # A model that named ids but gave no usable seconds is dropped:
+            # the prompt told it the numbers were ignored, so trusting a
+            # placeholder 0-0 would publish a mute clip from the opening.
+            try:
+                raw_start, raw_end = float(s.get("start") or 0), float(s.get("end") or 0)
+            except (TypeError, ValueError):
+                raw_start, raw_end = 0.0, 0.0
+            ids_given = bool(str(s.get("start_sentence") or "").strip()
+                             or str(s.get("end_sentence") or "").strip())
+            if ids_given and not (0 <= raw_start < raw_end):
+                dropped_bad_ids += 1
+                print(f"   Dropped a clip from {s.get('source_window_id')}: sentence ids "
+                      f"{s.get('start_sentence')!r}..{s.get('end_sentence')!r} did not resolve.")
+                continue
+            ns, ne = snap_clip_to_words(raw_start, raw_end, words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
+            anchored_shorts.append(s)
+        shorts = anchored_shorts
+        if anchored:
+            print(f"   Anchored {anchored}/{anchored + dropped_bad_ids} clip(s) to whole sentences.")
+        if dropped_bad_ids:
+            print(f"   Dropped {dropped_bad_ids} clip(s) with unusable sentence ids.")
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "

@@ -7,7 +7,9 @@ from clip_selection import (
     build_transcript_windows,
     clip_count_targets,
     dedupe_overlapping,
+    resolve_sentence_span,
     score_batches,
+    sentence_list,
     shortlist_target,
     snap_clip_to_words,
     compact_words,
@@ -89,6 +91,117 @@ class TestSnapClipToWords:
         words = self._words()
         start, end = snap_clip_to_words(0.0, 59.9, words, 80.0)
         assert end - start <= 60.0
+
+
+class TestSentenceSpans:
+    def _sentences(self, gaps=None):
+        # six 10-second sentences starting at 0, 10, 20... (or custom gaps)
+        gaps = gaps or []
+        out, t = [], 0.0
+        for i in range(6):
+            out.append({"start": t, "end": t + 10, "text": f"sentence {i}"})
+            t += 10 + (gaps[i] if i < len(gaps) else 0)
+        return sentence_list(out)
+
+    def test_ids_are_stable_and_ordered(self):
+        s = self._sentences()
+        assert [x["id"] for x in s] == [f"s{i:04d}" for i in range(1, 7)]
+
+    def test_span_covers_whole_sentences_and_never_steals_a_neighbour(self):
+        # segments are contiguous (0 s gap): padding must clamp to the gap,
+        # not add 150/350 ms of the previous/next sentence
+        s = self._sentences()
+        start, end = resolve_sentence_span("s0002", "s0003", s, 200, 15, 100)
+        assert start == pytest.approx(10.0)
+        assert end == pytest.approx(30.0)
+
+    def test_padding_uses_the_real_gap(self):
+        # 1 s of silence between sentences: up to half of it is kept
+        s = self._sentences(gaps=[1.0, 1.0, 1.0])
+        start, end = resolve_sentence_span("s0002", "s0002", s, 200, 5, 100)
+        assert start == pytest.approx(11 - 0.15)
+        assert end == pytest.approx(21 + 0.35)
+
+    def test_reversed_ids_are_reordered(self):
+        s = self._sentences()
+        assert resolve_sentence_span("s0003", "s0002", s, 200, 15, 100) == \
+            resolve_sentence_span("s0002", "s0003", s, 200, 15, 100)
+
+    def test_unknown_ids_return_none(self):
+        s = self._sentences()
+        assert resolve_sentence_span("nope", "s0002", s, 200, 15, 100) is None
+
+    def test_long_span_drops_trailing_sentences_to_meet_max(self):
+        s = self._sentences()
+        start, end = resolve_sentence_span("s0001", "s0006", s, 200, 15, 25)
+        assert end - start <= 25
+        # it kept whole sentences: the end is a sentence end
+        assert any(abs(end - x["end"]) < 1e-6 for x in s)
+
+    def test_short_span_grows_forward_to_meet_min(self):
+        s = self._sentences()
+        start, end = resolve_sentence_span("s0002", "s0002", s, 200, 25, 100)
+        assert end - start >= 25
+        # three whole sentences: 10 to 40 (contiguous, no padding)
+        assert end - start == pytest.approx(30.0)
+
+    def test_ids_are_normalised(self):
+        s = self._sentences()
+        assert resolve_sentence_span("2", "S0003", s, 200, 15, 100) == \
+            resolve_sentence_span("s0002", "s0003", s, 200, 15, 100)
+        from clip_selection import normalize_sentence_id
+        assert normalize_sentence_id("sentence 201") == "s0201"
+
+    def test_window_bounds_reject_foreign_ids(self):
+        s = self._sentences()
+        # s0006 lives at 50-60 s; a window ending at 30 s did not show it
+        assert resolve_sentence_span("s0006", "s0006", s, 200, 15, 100,
+                                     window_start=0, window_end=30) is None
+
+    def test_growth_never_leaves_the_window(self):
+        s = self._sentences()
+        # window ends at 25 s and only s0001+s0002 fit inside it: 20 s is all
+        # there is, so a 25 s minimum must fail rather than borrow s0003
+        assert resolve_sentence_span("s0002", "s0002", s, 200, 25, 100,
+                                     window_start=0, window_end=25) is None
+
+    def test_does_not_bridge_a_long_pause(self):
+        # sentence 1 ends at 10, sentence 2 starts at 40 (30 s pause)
+        s = self._sentences(gaps=[30])
+        assert resolve_sentence_span("s0001", "s0001", s, 200, 25, 100) is None
+
+    def test_one_sentence_longer_than_max_returns_none(self):
+        s = sentence_list([{"start": 0, "end": 90, "text": "one long sentence"}])
+        assert resolve_sentence_span("s0001", "s0001", s, 200, 15, 60) is None
+
+
+class TestSentenceClosure:
+    """Whisper segments that stop at a comma are not sentence ends."""
+
+    def _segs(self, texts):
+        return sentence_list([{"start": 10.0 * k, "end": 10.0 * k + 10, "text": x}
+                              for k, x in enumerate(texts)])
+
+    def test_end_runs_on_to_the_segment_that_closes_the_sentence(self):
+        s = self._segs(["Uno.", "dos, tres,", "cuatro y", "cinco.", "seis."])
+        start, end = resolve_sentence_span("s0002", "s0002", s, 200, 5, 100)
+        assert end == pytest.approx(40.0)   # through "cinco."
+
+    def test_start_steps_back_to_after_the_previous_full_stop(self):
+        s = self._segs(["Uno.", "dos, tres,", "cuatro y", "cinco.", "seis."])
+        start, end = resolve_sentence_span("s0003", "s0004", s, 200, 5, 100)
+        assert start == pytest.approx(10.0)  # "dos, tres," opens the sentence
+
+    def test_no_closing_within_max_keeps_whole_segments(self):
+        s = self._segs(["Uno.", "dos,", "tres,", "cuatro,", "cinco."])
+        start, end = resolve_sentence_span("s0002", "s0002", s, 200, 5, 25)
+        assert end - start <= 25
+        assert any(abs(end - x["end"]) < 1e-6 for x in s)
+
+    def test_trim_prefers_a_closing_segment(self):
+        s = self._segs(["Uno.", "dos.", "tres,", "cuatro,", "cinco."])
+        start, end = resolve_sentence_span("s0001", "s0005", s, 200, 15, 35)
+        assert end == pytest.approx(20.0)   # stops after "dos.", not mid-sentence
 
 
 class TestPricing:
