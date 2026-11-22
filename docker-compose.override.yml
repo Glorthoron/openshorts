@@ -23,6 +23,9 @@ services:
       - TMPDIR=/tmp
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - UPLOAD_POST_API_KEY=${UPLOAD_POST_API_KEY:-}
+      # Los codespaces salen por rangos de Azure y YouTube los bloquea con
+      # "Sign in to confirm you're not a bot". Cookies en formato Netscape.
+      - YOUTUBE_COOKIES=${YOUTUBE_COOKIES:-}
     volumes:
       - .:/app
       - /app/__pycache__
