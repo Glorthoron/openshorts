@@ -2552,6 +2552,11 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         # through the min-clips retry below (it only reads this shortlist):
         # that retry is what padded a pass with tangential clips.
         eligible = on_brief_windows(scored) if brief else scored
+        if brief:
+            # The floor is only tunable if a pass shows what it cut.
+            top = ", ".join(f"{w.get('id')}={w.get('score')} ({str(w.get('reason') or '')[:60]})"
+                            for w in scored[:5])
+            print(f"   Brief scores (best first): {top}")
         shortlist = [by_id[w["id"]] for w in eligible[:target] if w.get("id") in by_id]
         if not shortlist and brief:
             print(f"   🚫 Source off-brief: no window scored {ON_BRIEF_SCORE_FLOOR}+ "
