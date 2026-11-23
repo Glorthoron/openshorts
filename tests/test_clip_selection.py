@@ -151,6 +151,10 @@ class TestSentenceSpans:
             resolve_sentence_span("s0002", "s0003", s, 200, 15, 100)
         from clip_selection import normalize_sentence_id
         assert normalize_sentence_id("sentence 201") == "s0201"
+        # the prompt prints ids in brackets; models echo them that way
+        assert normalize_sentence_id("[s0201]") == "s0201"
+        assert normalize_sentence_id('"s0201".') == "s0201"
+        assert normalize_sentence_id("(S0201)") == "s0201"
 
     def test_window_bounds_reject_foreign_ids(self):
         s = self._sentences()

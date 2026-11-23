@@ -472,7 +472,10 @@ def normalize_sentence_id(raw):
     Small models copy ids loosely; a miss is not a wrong clip, just a fallback
     to the numeric proposal, but normalising keeps the common shapes working.
     """
-    text = str(raw or "").strip()
+    # The prompt shows ids in brackets, so models often echo "[s0041]",
+    # "s0041." or '"s0041"'. Strip that wrapper before matching; a bare
+    # bracketed id used to miss and silently fall back to the numeric times.
+    text = str(raw or "").strip().strip("[](){}<>\"'.,;: \t")
     match = _ID_RE.match(text)
     return f"s{int(match.group(1)):04d}" if match else text
 

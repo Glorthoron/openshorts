@@ -2513,7 +2513,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     item["text"] = " ".join(
                         f"[{s['id']}] {s['text']}"
                         for s in sentences
-                        if s["end"] > w["start"] and s["start"] < w["end"]
+                        # Same rule as resolve_sentence_span: only sentences
+                        # fully inside the window, so the model is never shown
+                        # an id the resolver would reject as foreign.
+                        if s["start"] >= w["start"] - 1e-6 and s["end"] <= w["end"] + 1e-6
                     )
                 h = heat.get(w["id"])
                 if h:
@@ -2643,6 +2646,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                 print(f"   Dropped a clip from {s.get('source_window_id')}: sentence ids "
                       f"{s.get('start_sentence')!r}..{s.get('end_sentence')!r} did not resolve.")
                 continue
+            if ids_given:
+                # Visible per-clip trace: an id miss used to fall back silently,
+                # which is how a whole video shipped unanchored on 23-nov.
+                print(f"   Fallback from {s.get('source_window_id')}: sentence ids "
+                      f"{s.get('start_sentence')!r}..{s.get('end_sentence')!r} did not resolve; "
+                      f"using the numeric proposal.")
             ns, ne = snap_clip_to_words(raw_start, raw_end, words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
