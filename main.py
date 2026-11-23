@@ -36,6 +36,8 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             detail_plan, vision_targets,
                             resolve_sentence_span, sentence_list,
+                            clean_brief, on_brief_windows, ON_BRIEF_SCORE_FLOOR,
+                            drop_leading_announcements,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
@@ -2462,6 +2464,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
+    # Optional channel brief (CHANNEL_BRIEF, set per job by /api/process).
+    # Without it every step below behaves exactly as before.
+    brief = clean_brief(os.environ.get("CHANNEL_BRIEF"))
+    brief_prefix = gemini_worker.brief_block(brief)
+    if brief:
+        print(f"   Channel brief on ({len(brief)} chars); score floor {ON_BRIEF_SCORE_FLOOR}.")
 
     # Full word list — ground truth for snapping cut points.
     words = []
@@ -2527,7 +2535,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             return out
 
         def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            return brief_prefix + gemini_worker.SCORE_PROMPT_TEMPLATE.format(
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
@@ -2540,12 +2548,21 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         # more candidates without exploding the detail call.
         scored.sort(key=lambda w: w.get("score", 0), reverse=True)
         by_id = {w["id"]: w for w in windows}
-        shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
+        # With a brief, windows under the floor never reach detail, not even
+        # through the min-clips retry below (it only reads this shortlist):
+        # that retry is what padded a pass with tangential clips.
+        eligible = on_brief_windows(scored) if brief else scored
+        shortlist = [by_id[w["id"]] for w in eligible[:target] if w.get("id") in by_id]
+        if not shortlist and brief:
+            print(f"   🚫 Source off-brief: no window scored {ON_BRIEF_SCORE_FLOOR}+ "
+                  f"for the channel brief ({len(scored)} scored). No clips.")
+            return None
         if not shortlist:
             shortlist = windows[:target]  # scoring returned nothing usable
         if heat:
             before = {w["id"] for w in shortlist}
-            ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
+            ranked = ([by_id[w["id"]] for w in eligible if w.get("id") in by_id]
+                      or (shortlist if brief else windows))
             shortlist = twitch_signals.promote_hot_windows(shortlist, ranked, heat, target)
             added = [w["id"] for w in shortlist if w["id"] not in before]
             if added:
@@ -2566,7 +2583,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             # A split batch keeps the full clip-count band: a short list can
             # still hold the best clips, and the model returns fewer anyway.
             def build(ws):
-                return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                return brief_prefix + gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
@@ -2661,6 +2678,26 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print(f"   Anchored {anchored}/{anchored + dropped_bad_ids} clip(s) to whole sentences.")
         if dropped_bad_ids:
             print(f"   Dropped {dropped_bad_ids} clip(s) with unusable sentence ids.")
+        if brief:
+            # Openings that only announce ("hoy les voy a enseñar…"). The
+            # model's delivers_payoff alone was signed true on every intro, and
+            # the pattern alone would also catch a real "vamos a ver" demo, so:
+            # announcement + no payoff = drop; announcement + payoff = cut the
+            # announcement and keep the rest if it still meets the band.
+            kept, cut, dropped_intro = [], 0, 0
+            for s in shorts:
+                span = drop_leading_announcements(s["start"], s["end"], sentences, min_secs)
+                opens_on_announcement = span != (s["start"], s["end"])
+                if span is None or (opens_on_announcement and s.get("delivers_payoff") is False):
+                    dropped_intro += 1
+                    continue
+                if opens_on_announcement:
+                    s["start"], s["end"] = span
+                    cut += 1
+                kept.append(s)
+            shorts = kept
+            if cut or dropped_intro:
+                print(f"   Announcement openings: trimmed {cut}, dropped {dropped_intro}.")
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "

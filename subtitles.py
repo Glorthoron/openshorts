@@ -35,6 +35,26 @@ WHISPER_TRANSCRIBE_PARAMS = {
 }
 
 
+def whisper_transcribe_params():
+    """WHISPER_TRANSCRIBE_PARAMS plus optional hints from the environment.
+
+    ``ASR_INITIAL_PROMPT``: a short sentence in the source language that sets
+    spelling and register. ``ASR_HOTWORDS`` (deployment) and
+    ``ASR_HOTWORDS_JOB`` (per job, e.g. the guest's name from the video
+    title): names and terms the model should prefer. Both are plain
+    faster-whisper options; unset, the params are exactly the defaults.
+    """
+    params = dict(WHISPER_TRANSCRIBE_PARAMS)
+    prompt = " ".join(os.environ.get("ASR_INITIAL_PROMPT", "").split())[:400]
+    if prompt:
+        params["initial_prompt"] = prompt
+    hot = ", ".join(p for p in (" ".join(os.environ.get(k, "").split())
+                                for k in ("ASR_HOTWORDS", "ASR_HOTWORDS_JOB")) if p)[:500]
+    if hot:
+        params["hotwords"] = hot
+    return params
+
+
 def merge_continuation_words(words):
     """Merge faster-whisper continuation fragments into their base word.
 

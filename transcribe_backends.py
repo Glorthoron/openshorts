@@ -36,6 +36,7 @@ import time
 from subtitles import (
     get_whisper_config,
     WHISPER_TRANSCRIBE_PARAMS,
+    whisper_transcribe_params,
     merge_continuation_words,
 )
 
@@ -307,7 +308,7 @@ def run_whisper_transcription(media_path, **params):
 
 
 def _transcribe_with_whisper(media_path):
-    segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
+    segments, info = run_whisper_transcription(media_path, **whisper_transcribe_params())
 
     out_segments = []
     text_parts = []
@@ -715,7 +716,7 @@ def _whisper_span(audio, language):
     Calls the model directly rather than through run_whisper_transcription so
     the user-facing progress lines are not printed once per span.
     """
-    params = dict(WHISPER_TRANSCRIBE_PARAMS, language=language, vad_filter=False)
+    params = dict(whisper_transcribe_params(), language=language, vad_filter=False)
     if _gpu_only and _whisper_device() == "cpu":
         raise GpuUnavailable("whisper is configured for the CPU")
     gate = _ASR_GATE if _whisper_device() != "cpu" else _NULL_GATE
@@ -865,7 +866,7 @@ def transcribe_media(media_path):
             if reason is None:
                 print(f"🎙️ [ASR] parakeet ok: lang={transcript['language']} "
                       f"segments={len(transcript['segments'])}")
-                return transcript
+                return _with_glossary(transcript)
             print(f"⚠️ [ASR] parakeet result rejected ({reason}) — "
                   f"falling back to whisper")
         except Exception as e:
@@ -877,4 +878,15 @@ def transcribe_media(media_path):
         except Exception as e:
             print(f"⚠️ [ASR] could not release parakeet ({type(e).__name__}: {e})")
 
-    return _transcribe_with_whisper(media_path)
+    return _with_glossary(_transcribe_with_whisper(media_path))
+
+
+def _with_glossary(transcript):
+    """Apply ASR_GLOSSARY (\"wrong => right; ...\" or JSON) once, so clip
+    selection and burned subtitles read the same fixed words. Unset = as is."""
+    from clip_selection import apply_glossary, parse_glossary
+    glossary = parse_glossary(os.environ.get("ASR_GLOSSARY"))
+    if not glossary:
+        return transcript
+    print(f"🎙️ [ASR] glossary: {len(glossary)} term(s)")
+    return apply_glossary(transcript, glossary)

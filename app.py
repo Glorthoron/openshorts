@@ -6151,6 +6151,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    channel_brief: Optional[str] = Form(None),
+    asr_hotwords: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -6185,6 +6187,8 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        channel_brief = body.get("channel_brief")
+        asr_hotwords = body.get("asr_hotwords")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -6283,6 +6287,17 @@ async def process_endpoint(
     env.update(chosen)
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
+    # Optional channel brief and ASR hints, per job, read by main.py
+    # (clip_selection.clean_brief / subtitles.whisper_transcribe_params).
+    # Absent = the job behaves exactly as before.
+    brief_text = " ".join(str(channel_brief or "").split())[:1500]
+    if brief_text:
+        env["CHANNEL_BRIEF"] = brief_text
+        print(f"[brief] job={job_id} chars={len(brief_text)}")
+    hot = asr_hotwords if isinstance(asr_hotwords, str) else ", ".join(map(str, asr_hotwords or []))
+    hot = " ".join(hot.split())[:500]
+    if hot:
+        env["ASR_HOTWORDS_JOB"] = hot
 
     # Auto-hook: burn each clip's Gemini hook text during the render. Off when
     # the field is absent, so API/MCP/webhook callers keep their old output

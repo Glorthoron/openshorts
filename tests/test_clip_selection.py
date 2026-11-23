@@ -528,3 +528,106 @@ def test_vision_segments_are_capped():
     segs = vision_segments(8 * 3600, 2400, 8)  # 12 stretches wanted
     assert len(segs) == 8
     assert segs[-1][1] < 8 * 3600
+
+
+class TestChannelBrief:
+    def test_floor_keeps_only_windows_at_or_above_it(self):
+        from clip_selection import on_brief_windows
+        scored = [{"id": "w1", "score": 72}, {"id": "w2", "score": 28},
+                  {"id": "w3", "score": 40}, {"id": "w4", "score": "x"}]
+        assert [w["id"] for w in on_brief_windows(scored)] == ["w1", "w3"]
+
+    def test_off_brief_source_leaves_nothing(self):
+        from clip_selection import on_brief_windows
+        assert on_brief_windows([{"id": "w", "score": s} for s in (8, 20, 39)]) == []
+
+    def test_brief_is_one_bounded_line(self):
+        from clip_selection import clean_brief, MAX_BRIEF_CHARS
+        assert clean_brief("  IA\n aplicada  ") == "IA aplicada"
+        assert len(clean_brief("x" * 5000)) == MAX_BRIEF_CHARS
+        assert clean_brief(None) == ""
+
+
+class TestAnnouncements:
+    def _s(self, texts):
+        return sentence_list([{"start": 10.0 * k, "end": 10.0 * k + 10, "text": t}
+                              for k, t in enumerate(texts)])
+
+    def test_detects_spanish_and_english_openers(self):
+        from clip_selection import is_announcement
+        assert is_announcement("Hoy les voy a enseñar a redactar un ensayo.")
+        assert is_announcement("Bueno, vamos a ver cómo se hace.")
+        assert is_announcement("In this video I explain it.")
+        assert not is_announcement("Claude Code me ahorra tres horas al día.")
+
+    def test_trims_the_announcement_and_keeps_the_delivery(self):
+        from clip_selection import drop_leading_announcements
+        s = self._s(["Hoy les voy a enseñar un truco.", "Abres Claude.", "Pegas el prompt.",
+                     "Y sale el informe."])
+        assert drop_leading_announcements(0.0, 40.0, s, 20) == (pytest.approx(9.85), 40.0)
+
+    def test_all_announcement_is_dropped(self):
+        from clip_selection import drop_leading_announcements
+        s = self._s(["Hoy les voy a enseñar algo.", "Vamos a ver tres cosas."])
+        assert drop_leading_announcements(0.0, 20.0, s, 5) is None
+
+    def test_untouched_when_it_opens_on_content(self):
+        from clip_selection import drop_leading_announcements
+        s = self._s(["Abres Claude.", "Pegas el prompt."])
+        assert drop_leading_announcements(0.0, 20.0, s, 5) == (0.0, 20.0)
+
+
+class TestGlossary:
+    def _t(self, words, text):
+        return {"text": text, "language": "es",
+                "segments": [{"start": 0, "end": 3, "text": text, "words": words}]}
+
+    def test_parse_both_shapes(self):
+        from clip_selection import parse_glossary
+        assert parse_glossary('{"chat GPT": "ChatGPT"}') == {"chat GPT": "ChatGPT"}
+        assert parse_glossary("chat GPT => ChatGPT; tremibundo=>tremebundo") == \
+            {"chat GPT": "ChatGPT", "tremibundo": "tremebundo"}
+        assert parse_glossary("") == {} and parse_glossary("{roto") == {}
+
+    def test_multiword_collapses_and_keeps_span_and_punctuation(self):
+        from clip_selection import apply_glossary
+        words = [{"word": " Uso", "start": 0.0, "end": 0.4},
+                 {"word": " chat", "start": 0.5, "end": 0.8},
+                 {"word": " GPT,", "start": 0.8, "end": 1.2},
+                 {"word": " siempre.", "start": 1.3, "end": 1.9}]
+        t = apply_glossary(self._t(words, " Uso chat GPT, siempre."), {"chat GPT": "ChatGPT"})
+        w = t["segments"][0]["words"]
+        assert [x["word"] for x in w] == [" Uso", " ChatGPT,", " siempre."]
+        assert (w[1]["start"], w[1]["end"]) == (0.5, 1.2)
+        assert t["segments"][0]["text"] == " Uso ChatGPT, siempre."
+        assert t["text"] == " Uso ChatGPT, siempre."
+
+    def test_single_word_swap_keeps_timestamps_and_does_not_mutate(self):
+        from clip_selection import apply_glossary
+        words = [{"word": " tremibundo", "start": 1.0, "end": 1.6}]
+        src = self._t(words, " tremibundo")
+        t = apply_glossary(src, {"tremibundo": "tremebundo"})
+        assert t["segments"][0]["words"] == [{"word": " tremebundo", "start": 1.0, "end": 1.6}]
+        assert src["segments"][0]["words"][0]["word"] == " tremibundo"
+
+    def test_no_partial_word_matches(self):
+        from clip_selection import apply_glossary
+        words = [{"word": " chatear", "start": 0, "end": 1}]
+        t = apply_glossary(self._t(words, " chatear"), {"chat": "Chat"})
+        assert t["segments"][0]["words"][0]["word"] == " chatear"
+        assert t["text"] == " chatear"
+
+
+class TestWhisperHints:
+    def test_defaults_without_env_and_hints_with_it(self, monkeypatch):
+        subtitles = pytest.importorskip("subtitles")
+        for k in ("ASR_INITIAL_PROMPT", "ASR_HOTWORDS", "ASR_HOTWORDS_JOB"):
+            monkeypatch.delenv(k, raising=False)
+        assert subtitles.whisper_transcribe_params() == subtitles.WHISPER_TRANSCRIBE_PARAMS
+        monkeypatch.setenv("ASR_INITIAL_PROMPT", "Charla sobre IA,  ChatGPT y Claude.")
+        monkeypatch.setenv("ASR_HOTWORDS", "ChatGPT, Claude")
+        monkeypatch.setenv("ASR_HOTWORDS_JOB", "Javier Recuenco")
+        p = subtitles.whisper_transcribe_params()
+        assert p["initial_prompt"] == "Charla sobre IA, ChatGPT y Claude."
+        assert p["hotwords"] == "ChatGPT, Claude, Javier Recuenco"
+        assert subtitles.WHISPER_TRANSCRIBE_PARAMS.get("hotwords") is None  # not mutated

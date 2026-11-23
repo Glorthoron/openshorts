@@ -671,3 +671,153 @@ def snap_clip_to_words(start, end, words, video_duration,
     if new_end <= new_start or new_end - new_start < min_duration:
         return original
     return (round(new_start, 3), round(new_end, 3))
+
+
+# --- Channel brief: keep a pass on the channel's niche ----------------------
+# A strong hook from the wrong niche still scored high: on a 23-nov-2026 pass
+# three of seven clips came from an essay-writing tutorial for an AI channel.
+# The brief is opt-in per job (CHANNEL_BRIEF); without it nothing below runs.
+# A per-clip "on_brief" flag from the model did not work (it signed true on
+# every clip, intro included), so the floor is structural: windows under it
+# never reach the detail pass.
+
+ON_BRIEF_SCORE_FLOOR = 40
+MAX_BRIEF_CHARS = 1500
+
+
+def clean_brief(raw):
+    """The brief as one bounded line of text, or "" when there is none."""
+    text = " ".join(str(raw or "").split())
+    return text[:MAX_BRIEF_CHARS]
+
+
+def on_brief_windows(scored, floor=ON_BRIEF_SCORE_FLOOR):
+    """Scored windows at or above the floor, best first. With a brief, these
+    are the only ones the detail pass (and its min-clips retry) may use."""
+    keep = []
+    for w in scored or []:
+        try:
+            score = float(w.get("score", 0))
+        except (TypeError, ValueError):
+            continue
+        if score >= floor:
+            keep.append(w)
+    return sorted(keep, key=lambda w: float(w.get("score", 0)), reverse=True)
+
+
+# Openings that announce instead of deliver ("hoy les voy a enseñar...").
+_ANNOUNCE_RE = re.compile(
+    r"^\W*(?:(?:y|bueno|pues|entonces|hola)\W+)*"
+    r"(?:hoy\s+(?:les|os|te)\s+voy\s+a|(?:les|os|te)\s+voy\s+a\s+(?:enseñar|mostrar|explicar|contar)"
+    r"|vamos\s+a\s+(?:ver|aprender|hablar)|en\s+este\s+v[ií]deo"
+    r"|today\s+i(?:'m|\s+am)?\s+(?:going\s+to|gonna)|in\s+this\s+video)",
+    re.IGNORECASE)
+
+
+def is_announcement(text):
+    """True when a sentence only announces what comes later."""
+    return bool(_ANNOUNCE_RE.search(str(text or "")))
+
+
+def drop_leading_announcements(start, end, sentences, min_duration):
+    """``(start, end)`` with announcement sentences cut from the opening.
+
+    Returns the span unchanged when it does not open on an announcement,
+    the trimmed span when what remains still meets ``min_duration``, and
+    ``None`` when the clip is (almost) all announcement.
+    """
+    inside = [s for s in sentences or []
+              if s["start"] >= start - 0.5 and s["end"] <= end + 0.5]
+    k = 0
+    while k < len(inside) and is_announcement(inside[k]["text"]):
+        k += 1
+    if k == 0:
+        return (start, end)
+    if k >= len(inside):
+        return None
+    new_start = max(start, inside[k]["start"] - 0.15)
+    if end - new_start < float(min_duration):
+        return None
+    return (round(new_start, 3), end)
+
+
+# --- ASR glossary: fix recurring mis-hearings before anything reads them ----
+# Whisper small writes "chat GPT", "desintergrados"... and the text is burned
+# as is. Applied once to the transcript, so selection and subtitles see the
+# same fixed words. One-to-one swaps keep the word's timestamps; a multi-word
+# match collapses into one word spanning first start to last end.
+
+_EDGE_PUNCT = ".,;:!?¡¿\"'«»()[]…"
+
+
+def parse_glossary(raw):
+    """``{"wrong": "right"}`` from JSON or ``"wrong => right; a => b"``."""
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("{"):
+        import json
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return {}
+        return {str(k).strip(): str(v).strip() for k, v in data.items()
+                if str(k).strip() and str(v).strip()}
+    out = {}
+    for part in re.split(r"[;\n]", text):
+        if "=>" in part:
+            wrong, right = part.split("=>", 1)
+            if wrong.strip() and right.strip():
+                out[wrong.strip()] = right.strip()
+    return out
+
+
+def _norm_token(word):
+    return str(word or "").strip().strip(_EDGE_PUNCT).lower()
+
+
+def _apply_to_words(words, entries):
+    out, i = [], 0
+    while i < len(words):
+        for tokens, right in entries:
+            k = len(tokens)
+            if [_norm_token(w["word"]) for w in words[i:i + k]] == tokens:
+                first, last = words[i], words[i + k - 1]
+                raw_last = str(last["word"]).rstrip()
+                trail = raw_last[len(raw_last.rstrip(_EDGE_PUNCT)):]
+                lead = str(first["word"])[:len(str(first["word"])) - len(str(first["word"]).lstrip())]
+                out.append({**first, "word": f"{lead}{right}{trail}", "end": last["end"]})
+                i += k
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
+def apply_glossary(transcript, glossary):
+    """A new transcript with every glossary entry fixed in words and text."""
+    if not glossary or not transcript:
+        return transcript
+    entries = sorted(((_norm_token_list(w), r) for w, r in glossary.items()),
+                     key=lambda e: len(e[0]), reverse=True)
+    entries = [e for e in entries if e[0]]
+    patterns = [(re.compile(r"(?<!\w)" + r"\s+".join(map(re.escape, w.split())) + r"(?!\w)",
+                            re.IGNORECASE), r) for w, r in glossary.items() if w.split()]
+
+    def fix_text(text):
+        for rx, right in patterns:
+            text = rx.sub(right, text)
+        return text
+
+    segments = []
+    for seg in transcript.get("segments") or []:
+        segments.append({**seg,
+                         "text": fix_text(str(seg.get("text") or "")),
+                         "words": _apply_to_words(list(seg.get("words") or []), entries)})
+    return {**transcript, "segments": segments,
+            "text": fix_text(str(transcript.get("text") or ""))}
+
+
+def _norm_token_list(phrase):
+    return [t for t in (_norm_token(p) for p in str(phrase).split()) if t]

@@ -57,6 +57,16 @@ class DetailClipModel(BaseModel):
     # the dashboard. Defaulted so a small local model that skips it does not
     # fail schema validation and lose the clip.
     why: str = ""
+    # False when the clip only announces or sets up what it promises. Read
+    # with a channel brief only, and only together with the announcement
+    # check on the opening sentence (clip_selection.drop_leading_announcements):
+    # alone it was signed true on every clip of an off-brief tutorial.
+    delivers_payoff: bool = True
+
+    @field_validator("delivers_payoff", mode="before")
+    @classmethod
+    def _payoff(cls, value):
+        return True if value is None else value
 
 
 class DetailResponse(BaseModel):
@@ -370,6 +380,9 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 - `predicted_score`: honest 0-100 estimate of viral potential.
 - `why`: one sentence, max 20 words, naming what makes THIS moment worth a
   clip — the specific hook, claim, number or payoff, not the topic.
+- `delivers_payoff`: true only when the clip itself shows or states what it
+  promises; false for an intro, an announcement ("today I'll show you…") or a
+  setup whose payoff falls outside the clip.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -390,11 +403,38 @@ Return only:
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
       "viral_hook_text": "<short overlay max 10 words>",
-      "why": "<one sentence, max 20 words>"
+      "why": "<one sentence, max 20 words>",
+      "delivers_payoff": <true|false>
     }}
   ]
 }}
 """
+
+
+# Prepended to the SCORE and DETAIL prompts when a job carries a channel brief
+# (CHANNEL_BRIEF). One constant so both passes judge fit the same way; with no
+# brief the prompts are exactly the templates above.
+CHANNEL_BRIEF_RULES = """
+CHANNEL BRIEF — every clip is for this channel:
+{brief}
+
+Fit to the brief comes before hook strength:
+- A window or clip OFF this brief scores under 20 and is never a clip, however
+  strong its hook.
+- A promise without its delivery inside the same stretch ("today I'll show
+  you…", "vamos a ver…") does not count as a moment.
+- Setup only, definitions, recaps, rambling, or repeating the same idea do not
+  count as a moment.
+- The moment must name something concrete: a tool, a number, an action or a
+  result.
+These rules add to the ones below; they replace none of them.
+"""
+
+
+def brief_block(brief) -> str:
+    """The brief rules for a prompt, or "" when the job has no brief."""
+    text = " ".join(str(brief or "").split())
+    return CHANNEL_BRIEF_RULES.format(brief=text) if text else ""
 
 
 def _strip_code_fences(text: str) -> str:
@@ -638,7 +678,7 @@ def main() -> int:
         # placeholder for one: it ranks whatever it is given.
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
-    prompt = template.format(**fmt)
+    prompt = brief_block(os.environ.get("CHANNEL_BRIEF")) + template.format(**fmt)
 
     _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
     response = client.models.generate_content(
